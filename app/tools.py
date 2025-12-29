@@ -1,51 +1,71 @@
 # tools.py
+import json
+import os
+import re
 import psycopg2
+from psycopg2.extras import RealDictCursor
 from langchain_core.tools import tool
 from config import DB_CONFIG, chroma_collection
+
+# Allow SELECT or WITH ... SELECT only. Block multi-statement and writes.
+READONLY_RE = re.compile(r"^\s*(with\b[\s\S]*?\bselect\b|select\b)", re.IGNORECASE)
+
+BLOCKLIST_RE = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|merge|call|execute|do)\b",
+    re.IGNORECASE,
+)
+
+def _is_readonly_single_statement(sql: str) -> bool:
+    s = sql.strip()
+    # Block internal semicolons (multi-statement). Allow trailing semicolon only.
+    if ";" in s.rstrip(";"):
+        return False
+    if BLOCKLIST_RE.search(s):
+        return False
+    return bool(READONLY_RE.match(s))
 
 @tool
 def sql_database_tool(query: str) -> str:
     """
-    Executes a read-only SQL query against the PostgreSQL database and returns the result.
-    Use this tool to answer questions about data in the database.
-    Example queries:
-    'SELECT COUNT(*) FROM students;'
-    'SELECT gender, AVG(math_score) FROM performance JOIN students ON performance.student_id = students.student_id GROUP BY gender;'
+    Executes a READ-ONLY SQL query (SELECT / WITH ... SELECT) and returns JSON.
     """
+    if not _is_readonly_single_statement(query):
+        return "[SQL_ERROR] Only single-statement, read-only SELECT queries are allowed."
+
+    conn = None
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute(query)
+        conn = psycopg2.connect(**DB_CONFIG, connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "5")))
+        conn.set_session(readonly=True, autocommit=True)
 
-        if cur.description:
-            rows = cur.fetchall()
-            headers = [desc[0] for desc in cur.description]
-            results = [dict(zip(headers, row)) for row in rows]
-            conn.close()
-            if not results:
-                return "[DATABASE] Query executed successfully, but returned no results."
-            return str(results)
-        else:
+        # RealDictCursor returns dict rows directly
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query)
 
-            conn.commit()
-            conn.close()
-            return f"[DATABASE] Non-SELECT query executed successfully. {cur.rowcount} rows affected."
+            if cur.description:
+                rows = cur.fetchall()  # list[dict]
+                if not rows:
+                    return json.dumps({"rows": [], "message": "Query executed successfully, but returned no results."})
+                return json.dumps({"rows": rows})
+            return json.dumps({"rows": [], "message": "Query executed successfully (no rows)."})
     except Exception as e:
         return f"[SQL_ERROR] {e}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 @tool
 def vector_store_retrieval_tool(query: str) -> str:
     """
-    Retrieves relevant context, examples, or database schema information from the vector store.
-    Use this to get information about table structures, column names, or how to use the system.
-    For example: 'What are the columns in the students table?' or 'Describe the course table.'
+    Retrieves relevant schema/context from the vector store.
     """
     try:
         results = chroma_collection.query(query_texts=[query], n_results=1)
         documents = results.get("documents", [[]])[0]
         if documents:
             return documents[0]
-        else:
-            return "[VECTOR_STORE] No specific schema information found for that query."
+        return "[VECTOR_STORE] No specific schema information found for that query."
     except Exception as e:
         return f"[VECTOR_STORE_ERROR] {e}"
